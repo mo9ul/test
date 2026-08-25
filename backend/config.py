@@ -24,6 +24,42 @@ class Settings(BaseSettings):
     # HTTP deadline. Gemini가 10초 미만을 거부하므로(400 "Minimum allowed deadline is 10s")
     # 이보다 낮게 설정할 수 없다. 실측 응답은 2초대이므로 이 값은 예산이 아니라 안전망이다.
     GEMINI_TIMEOUT_SECONDS: float = 10.0
+    # --- 되돌릴 수 없는 행동 게이트 ---
+    # SENSITIVE_KEYWORDS(탐지·로깅용)와 목적이 다르다. 이쪽은 "누르면 되돌릴 수 없는 행동"만
+    # 담는다 — 비밀번호/인증/계좌 같은 '민감 정보' 항목은 여기 넣지 않는다(그건 버튼이 아니다).
+    IRREVERSIBLE_KEYWORDS: list[str] = [
+        "전송",
+        "보내기",
+        "송금",
+        "이체",
+        "결제",
+        "구매",
+        "주문",
+        "삭제",
+        "탈퇴",
+    ]
+    # 확인 질문에 대한 사용자의 동의 표현. 이 중 하나가 user_speech에 있어야 게이트를 통과한다.
+    AFFIRMATIVE_WORDS: list[str] = [
+        "응",
+        "어",
+        "네",
+        "예",
+        "그래",
+        "좋아",
+        "해줘",
+        "보내",
+        "진행",
+        "확인",
+        "맞아",
+        "오케이",
+    ]
+
+    # --- 규칙 기반 최적화 (services/rules.py) ---
+    MAX_ELEMENTS_TO_LLM: int = 60
+    # 같은 화면에서 연속 몇 스텝까지 허용할지. 입력→클릭처럼 한 화면에서 여러 스텝이
+    # 정상인 경우가 있어 3은 너무 빡빡하다.
+    MAX_REPEATED_SCREENS: int = 5
+
     SENSITIVE_KEYWORDS: list[str] = [
         "전송",
         "보내기",

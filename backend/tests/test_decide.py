@@ -8,8 +8,22 @@ from backend.main import app
 from backend.routers.decide import get_ai_client
 from backend.schemas.response import DecideResponse
 from backend.services.ai_client import AIClientError, MockAIClient
+from backend.services.session import session_manager
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sessions():
+    """세션은 프로세스 메모리에 남으므로 테스트마다 비운다.
+
+    history·결정 캐시·화면 반복 카운터가 모두 session_id 단위로 누적되는데
+    테스트들이 같은 session_id를 공유하기 때문에, 비우지 않으면 실행 순서에
+    따라 결과가 달라진다.
+    """
+    session_manager.reset()
+    yield
+    session_manager.reset()
 
 BASE_ELEMENT = {
     "id": 1,
@@ -247,16 +261,62 @@ def test_send_element_is_not_filtered_from_ai_input() -> None:
     assert captured[0].text == "전송"
 
 
-def test_send_element_can_be_clicked() -> None:
-    """전송 버튼을 target으로 지목한 응답이 게이트에서 걸리지 않고 그대로 통과한다."""
+def test_send_element_requires_spoken_confirmation() -> None:
+    """전송 버튼은 구두 동의 전까지 눌리지 않는다.
+
+    ※ 정책 변경: 이전에는 전송 버튼도 특별 취급 없이 통과시켰다. 제품 요구사항
+    ("결제·전송 직전에 동의를 받고, 동의하면 그 버튼까지 AI가 누른다")에 맞춰
+    서버가 ASK_USER로 되묻도록 바뀌었다. Android는 기존 ASK_USER 처리를 그대로 쓴다.
+    """
     _stub_client(_response(instruction="전송 버튼 클릭"))
 
     elements = [{**BASE_ELEMENT, "text": "전송"}]
     body = client.post("/api/v1/decide", json=_payload(elements=elements)).json()
 
+    assert body["status"] == "ASK_USER"
+    assert body["target_node_id"] is None
+    assert body["voice_message"] == "전송을 진행할까요?"
+
+
+def test_send_element_is_clicked_after_affirmative_confirmation() -> None:
+    """동의를 받은 뒤에는 AI가 전송 버튼을 실제로 누른다."""
+    _stub_client(_response(instruction="전송 버튼 클릭"))
+    elements = [{**BASE_ELEMENT, "text": "전송"}]
+
+    first = client.post("/api/v1/decide", json=_payload(elements=elements)).json()
+    assert first["status"] == "ASK_USER"
+
+    second = client.post(
+        "/api/v1/decide", json=_payload(elements=elements, user_speech="응 보내줘")
+    ).json()
+
+    assert second["status"] == "CONTINUE"
+    assert second["target_node_id"] == 1
+    assert second["action_type"] == "CLICK"
+
+
+def test_send_element_stays_blocked_without_affirmative() -> None:
+    """확인 질문에 동의가 아닌 답이 오면 계속 막는다."""
+    _stub_client(_response(instruction="전송 버튼 클릭"))
+    elements = [{**BASE_ELEMENT, "text": "전송"}]
+
+    client.post("/api/v1/decide", json=_payload(elements=elements))
+    body = client.post(
+        "/api/v1/decide", json=_payload(elements=elements, user_speech="잠깐만요")
+    ).json()
+
+    assert body["status"] == "ASK_USER"
+    assert body["target_node_id"] is None
+
+
+def test_ordinary_element_is_not_gated() -> None:
+    """되돌릴 수 없는 행동이 아니면 게이트가 개입하지 않는다."""
+    _stub_client(_response())
+
+    body = client.post("/api/v1/decide", json=_payload()).json()
+
     assert body["status"] == "CONTINUE"
     assert body["target_node_id"] == 1
-    assert body["action_type"] == "CLICK"
 
 
 # --- 마스킹 / 로깅 ---------------------------------------------------------
