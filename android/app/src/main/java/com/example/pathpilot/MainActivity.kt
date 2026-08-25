@@ -21,7 +21,10 @@ import com.example.pathpilot.wakeup.WakeAndLaunchActivity
 /**
  * 앱을 열면 곧바로 요청을 받지 않고, 웨이크 문구("안녕 " + [WakeWordSettings]에 저장된 이름, 기본값
  * "손자")가 들릴 때까지 대기한다. 웨이크 문구를 들으면 그제서야 "네, 말씀하세요"로 실제 요청을
- * 받고, 받은 요청을 [WakeAndLaunchActivity]에 넘겨 카카오톡 자동화로 이어준다.
+ * 받고, 받은 요청을 [WakeAndLaunchActivity]에 넘긴다.
+ *
+ * **어느 앱을 열지는 여기서 정하지 않는다.** [WakeAndLaunchActivity]가 서버에 물어보고
+ * `LAUNCH_APP`으로 받은 앱을 실행한다 — 그래서 이 파일에도 앱 이름이 없다 (CLAUDE.md §12).
  */
 class MainActivity : AppCompatActivity() {
 
@@ -96,7 +99,7 @@ class MainActivity : AppCompatActivity() {
                 statusText.text = getString(R.string.main_status_wake_detected)
                 voice.askAndListen(
                     question = getString(R.string.main_prompt_after_wake),
-                    onAnswer = { goal -> launchKakaoWithGoal(goal) },
+                    onAnswer = { goal -> startAgentWithGoal(goal) },
                     onError = {
                         statusText.text = getString(R.string.main_status_answer_failed)
                         restartWakeListening()
@@ -109,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun launchKakaoWithGoal(goal: String) {
+    private fun startAgentWithGoal(goal: String) {
         statusText.text = getString(R.string.main_status_goal_captured, goal)
         startActivity(
             Intent(this, WakeAndLaunchActivity::class.java).apply {

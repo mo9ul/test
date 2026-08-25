@@ -1,14 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  멤버 A(나) 개인 테스트용 AccessibilityService 설정.
-  카카오톡 하나만 대상으로 제한해서, 실수로 다른 앱(특히 실제 결제가 자동 실행되는 코레일+)에
-  적용되지 않도록 한다. 멤버 C가 정식 서비스를 만들면 이 파일과 TestAccessibilityService는
-  지운다 — docs/ARCHITECTURE.md §2 참고.
+  packageNames를 지정하지 않는다 = 모든 앱의 이벤트를 받는다.
+
+  원래는 com.kakao.talk 하나로 묶여 있었다. "실수로 결제 앱에 적용되는 것을 막는다"는
+  의도였는데, 대상 앱을 서버가 고르는 구조에서는 OS가 다른 앱 이벤트를 아예 주지 않아
+  앱 선택 자체가 성립하지 않는다.
+
+  대신 더 강한 두 가지로 대체했다.
+   1. AgentTarget.packageName이 정해지기 전에는 어떤 화면에도 개입하지 않는다.
+      즉 사용자가 웨이크 문구로 부르고 목표를 말하기 전에는 아무 일도 하지 않는다.
+   2. 전송·결제 계열 버튼은 구두 동의를 받기 전까지 서버가 막는다
+      (backend/services/safety.py의 되돌릴 수 없는 행동 게이트).
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:canRetrieveWindowContent="true"
     android:notificationTimeout="300"
-    android:packageNames="com.kakao.talk"
     android:description="@string/test_accessibility_service_description" />

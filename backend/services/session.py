@@ -12,6 +12,12 @@ MAX_HISTORY = 3
 class SessionData:
     history: list[HistoryEntry] = field(default_factory=list)
     step_counter: int = 0
+    # 되돌릴 수 없는 행동에 대해 확인을 요청한 노드 라벨. 동의를 받은 뒤 통과시키는 데 쓴다.
+    pending_confirmation: str | None = None
+    # 확인을 요청한 그 순간의 goal. 다음 턴의 goal에서 이만큼을 뺀 '증분'이 사용자의 답변이다.
+    pending_goal_snapshot: str = ""
+    last_signature: str | None = None
+    repeat_count: int = 0
     last_accessed: float = field(default_factory=time.time)
 
 
@@ -43,6 +49,40 @@ class SessionManager:
             session.history = session.history[-MAX_HISTORY:]
             session.last_accessed = time.time()
             return entry
+
+    def get_pending_confirmation(self, session_id: str) -> tuple[str | None, str]:
+        """(확인 요청한 노드 라벨, 그때의 goal)을 반환한다."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None, ""
+            return session.pending_confirmation, session.pending_goal_snapshot
+
+    def set_pending_confirmation(
+        self, session_id: str, label: str | None, goal_snapshot: str = ""
+    ) -> None:
+        with self._lock:
+            session = self._sessions.setdefault(session_id, SessionData())
+            session.pending_confirmation = label
+            session.pending_goal_snapshot = goal_snapshot if label else ""
+            session.last_accessed = time.time()
+
+    def bump_signature(self, session_id: str, signature: str) -> int:
+        """같은 화면이 연속으로 몇 번째인지 반환한다. 클릭이 안 먹는 상황 감지용."""
+        with self._lock:
+            session = self._sessions.setdefault(session_id, SessionData())
+            if session.last_signature == signature:
+                session.repeat_count += 1
+            else:
+                session.last_signature = signature
+                session.repeat_count = 1
+            session.last_accessed = time.time()
+            return session.repeat_count
+
+    def reset(self) -> None:
+        """테스트 전용 — 세션 저장소를 비운다."""
+        with self._lock:
+            self._sessions.clear()
 
     def _evict_expired(self) -> None:
         now = time.time()

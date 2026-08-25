@@ -8,7 +8,7 @@ from backend.config import Settings, get_settings
 from backend.core.logging import get_logger
 from backend.schemas.request import DecideRequest
 from backend.schemas.response import DecideResponse
-from backend.services import prompt, safety
+from backend.services import prompt, rules, safety
 from backend.services.ai_client import (
     AIClient,
     AIClientError,
@@ -75,58 +75,138 @@ async def decide(
 
     # 3. 세션 로드 — 요청에 history가 실려오면 그것을 우선하고, 없으면 서버 세션에서 조회
     history = request.history or session_manager.get_history(request.session_id)
+    pending_confirmation, pending_goal_snapshot = session_manager.get_pending_confirmation(
+        request.session_id
+    )
 
     # 4. 개인정보 마스킹 — LLM에 나가는 텍스트에서 전화번호/계좌번호/주민번호 패턴 제거
     masked_elements = safety.mask_sensitive_text(request.elements)
 
-    # 5. LLM 호출 — 동기 구현체를 스레드로 offload하고 타임아웃을 건다
-    try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                ai_client.decide,
-                goal=request.goal,
-                app_package=request.app_package,
-                elements=masked_elements,
-                history=history,
-                user_speech=request.user_speech,
-            ),
-            timeout=AI_CLIENT_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        # 타임아웃은 게이트/검증을 거치지 않는 최종 응답이다.
+    # 5. 규칙 필터링 — 면적 0·순수 컨테이너·중복 노드는 LLM에 보내지 않는다(services/rules.py)
+    filtered_elements = rules.filter_elements(masked_elements, settings)
+    signature = rules.screen_signature(request.app_package, filtered_elements)
+    repeat = session_manager.bump_signature(request.session_id, signature)
+
+    response: DecideResponse | None = None
+    rule_hit: str | None = None
+    llm_called = False
+
+    # 6. 규칙 단축 경로 — 답이 정해진 화면은 LLM에 묻지 않는다.
+    #    여기서 만들어진 응답도 아래 8의 게이트/검증을 똑같이 통과한다.
+    if repeat > settings.MAX_REPEATED_SCREENS:
+        # 같은 화면이 계속 반복된다 = 클릭이 먹지 않고 있다. 무한 루프와 무한 과금을 끊는다.
         response = DecideResponse(
             target_node_id=None,
             action_type=None,
             input_value=None,
-            instruction="AI 응답이 지연되어 이번 단계를 처리할 수 없음",
-            voice_message="잠시 응답이 늦어지고 있어요. 다시 시도해 주세요.",
-            confidence=0.0,
+            instruction=f"same screen repeated {repeat} times",
+            voice_message="화면이 바뀌지 않아 더 진행할 수 없어요. 직접 눌러 주시겠어요?",
+            confidence=1.0,
             status="UNSUPPORTED",
-            reason="AI 응답 지연",
+            reason="화면 반복",
         )
-    except AIClientError as exc:
-        # LLM 호출/파싱 실패. 서버가 죽지 않고 계약대로 응답한다(CLAUDE.md 12장).
-        # 상세 사유는 로그로만 남기고 응답 본문에는 넣지 않는다.
-        logger.warning("ai client failed", extra={"detail": str(exc)})
+        rule_hit = "repeat_guard"
+    elif request.app_package is None:
+        # 아직 앱을 열지 않은 첫 스텝. goal에서 앱을 직접 짚어낼 수 있으면 LLM 콜을 통째로 아낀다.
+        package = rules.resolve_app(request.goal, request.installed_apps, settings)
+        if package is not None:
+            label = next(
+                (a.label for a in (request.installed_apps or []) if a.package == package),
+                package,
+            )
+            response = DecideResponse(
+                target_node_id=None,
+                action_type="LAUNCH_APP",
+                input_value=package,
+                instruction=f"{package} 실행 (규칙 매칭)",
+                voice_message=f"{label} 열게요.",
+                confidence=1.0,
+                status="CONTINUE",
+                reason="resolved by rule",
+            )
+            rule_hit = "app_resolution"
+    elif rules.is_loading_screen(filtered_elements):
+        # 조작 가능한 요소가 하나도 없다 = 아직 로딩 중. LLM에 물어봐야 답이 없다.
+        # voice_message는 비워 둔다 — 로딩마다 TTS가 울리면 시끄럽다.
         response = DecideResponse(
             target_node_id=None,
             action_type=None,
             input_value=None,
-            instruction="AI 호출에 실패해 이번 단계를 처리할 수 없음",
-            voice_message="죄송해요, 지금은 화면을 읽지 못했어요. 다시 시도해 주세요.",
-            confidence=0.0,
-            status="UNSUPPORTED",
-            reason="AI 호출 실패",
+            instruction="loading screen - no actionable element",
+            voice_message="",
+            confidence=1.0,
+            status="CONTINUE",
+            reason="로딩 대기",
         )
-    else:
-        # 6. confidence 게이트 — 임계값 미만이면 ASK_USER로 강제 override
-        response = safety.check_confidence(response, settings.CONFIDENCE_THRESHOLD)
+        rule_hit = "loading_screen"
+    # 7. LLM 호출 — 동기 구현체를 스레드로 offload하고 타임아웃을 건다
+    if response is None:
+        llm_called = True
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    ai_client.decide,
+                    goal=request.goal,
+                    app_package=request.app_package,
+                    elements=filtered_elements,
+                    history=history,
+                    user_speech=request.user_speech,
+                    installed_apps=request.installed_apps,
+                ),
+                timeout=AI_CLIENT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # 타임아웃은 게이트/검증을 거치지 않는 최종 응답이다.
+            response = DecideResponse(
+                target_node_id=None,
+                action_type=None,
+                input_value=None,
+                instruction="AI 응답이 지연되어 이번 단계를 처리할 수 없음",
+                voice_message="잠시 응답이 늦어지고 있어요. 다시 시도해 주세요.",
+                confidence=0.0,
+                status="UNSUPPORTED",
+                reason="AI 응답 지연",
+            )
+        except AIClientError as exc:
+            # LLM 호출/파싱 실패. 서버가 죽지 않고 계약대로 응답한다(CLAUDE.md 12장).
+            # 상세 사유는 로그로만 남기고 응답 본문에는 넣지 않는다.
+            logger.warning("ai client failed", extra={"detail": str(exc)})
+            response = DecideResponse(
+                target_node_id=None,
+                action_type=None,
+                input_value=None,
+                instruction="AI 호출에 실패해 이번 단계를 처리할 수 없음",
+                voice_message="죄송해요, 지금은 화면을 읽지 못했어요. 다시 시도해 주세요.",
+                confidence=0.0,
+                status="UNSUPPORTED",
+                reason="AI 호출 실패",
+            )
+        else:
+            # 8-1. confidence 게이트 — 임계값 미만이면 ASK_USER로 강제 override
+            response = safety.check_confidence(response, settings.CONFIDENCE_THRESHOLD)
 
-        # 7. 응답 검증 — 지어낸 node_id 차단 후, action_type/input_value 정합성 확인
-        response = safety.validate_target_node_id(response, request.elements)
-        response = safety.validate_action(response)
+            # 8-2. 응답 검증 — 지어낸 node_id 차단 후, action_type/input_value 정합성 확인
+            response = safety.validate_target_node_id(response, request.elements)
+            response = safety.validate_action(response)
 
-    # 8. 로깅 — text/content_description 원문은 어떤 경우에도 기록하지 않는다
+
+    # 8-3. 되돌릴 수 없는 행동 게이트 — 구두 동의 없이 전송/결제 버튼을 누르지 않는다.
+    #      LLM 경로든 규칙 경로든 예외 없이 여기를 통과한다.
+    response, pending_confirmation = safety.check_irreversible_action(
+        response,
+        request.elements,
+        pending_confirmation=pending_confirmation,
+        pending_goal_snapshot=pending_goal_snapshot,
+        goal=request.goal,
+        user_speech=request.user_speech,
+        irreversible_keywords=settings.IRREVERSIBLE_KEYWORDS,
+        affirmative_words=settings.AFFIRMATIVE_WORDS,
+    )
+    session_manager.set_pending_confirmation(
+        request.session_id, pending_confirmation, request.goal
+    )
+
+    # 9. 로깅 — text/content_description 원문은 어떤 경우에도 기록하지 않는다
     latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
     logger.info(
         "decide request processed",
@@ -138,6 +218,10 @@ async def decide(
             "confidence": response.confidence,
             "status": response.status,
             "elements_count": len(request.elements),
+            "elements_to_llm": len(filtered_elements),
+            "llm_called": llm_called,
+            "rule_hit": rule_hit,
+            "screen_repeat": repeat,
             "sensitive_elements_count": len(sensitive_elements),
             "has_user_speech": request.user_speech is not None,
             "prompt_version": prompt.PROMPT_VERSION,
@@ -145,10 +229,10 @@ async def decide(
         },
     )
 
-    # 9. 세션 갱신 — 이번 step 결과를 history에 추가, 최근 N개만 유지
+    # 10. 세션 갱신 — 이번 step 결과를 history에 추가, 최근 N개만 유지
     session_manager.update_history(request.session_id, _history_summary(response))
 
-    # 10. 응답 반환
+    # 11. 응답 반환
     return response
 
 

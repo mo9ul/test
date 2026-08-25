@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from backend.core.logging import get_logger
 from backend.schemas.llm import NO_ACTION, NO_TARGET_NODE_ID, LLMDecision
-from backend.schemas.request import ElementDTO, HistoryEntry
+from backend.schemas.request import ElementDTO, HistoryEntry, InstalledApp
 from backend.schemas.response import DecideResponse
 from backend.services import prompt
 
@@ -68,10 +68,11 @@ class AIClient(Protocol):
     def decide(
         self,
         goal: str,
-        app_package: str,
+        app_package: str | None,
         elements: list[ElementDTO],
         history: list[HistoryEntry] | None,
         user_speech: str | None,
+        installed_apps: list[InstalledApp] | None = None,
     ) -> DecideResponse: ...
 
 
@@ -81,11 +82,15 @@ class MockAIClient:
     def decide(
         self,
         goal: str,
-        app_package: str,
+        app_package: str | None,
         elements: list[ElementDTO],
         history: list[HistoryEntry] | None,
         user_speech: str | None = None,
+        installed_apps: list[InstalledApp] | None = None,
     ) -> DecideResponse:
+        if app_package is None:
+            return self._launch_app(installed_apps)
+
         if user_speech:
             declined = self._check_declined(user_speech)
             if declined is not None:
@@ -130,6 +135,32 @@ class MockAIClient:
                 else "다음 단계로 넘어갈게요."
             ),
             confidence=0.9,
+            status="CONTINUE",
+            reason=None,
+        )
+
+    @staticmethod
+    def _launch_app(installed_apps: list[InstalledApp] | None) -> DecideResponse:
+        """아직 앱이 안 열린 상태. Mock은 목표를 이해하지 못하므로 첫 앱을 연다."""
+        if not installed_apps:
+            return DecideResponse(
+                target_node_id=None,
+                action_type=None,
+                input_value=None,
+                instruction="설치된 앱 목록이 없어 대상 앱을 정할 수 없음",
+                voice_message="어떤 앱으로 해드릴까요?",
+                confidence=1.0,
+                status="ASK_USER",
+                reason="no installed_apps provided",
+            )
+        target = installed_apps[0]
+        return DecideResponse(
+            target_node_id=None,
+            action_type="LAUNCH_APP",
+            input_value=target.package,
+            instruction=f"{target.package} 실행",
+            voice_message=f"{target.label}을(를) 열게요.",
+            confidence=0.99,
             status="CONTINUE",
             reason=None,
         )
@@ -221,10 +252,11 @@ class GeminiAIClient:
     def decide(
         self,
         goal: str,
-        app_package: str,
+        app_package: str | None,
         elements: list[ElementDTO],
         history: list[HistoryEntry] | None,
         user_speech: str | None = None,
+        installed_apps: list[InstalledApp] | None = None,
     ) -> DecideResponse:
         user_input = prompt.build_input(
             goal=goal,
@@ -232,6 +264,7 @@ class GeminiAIClient:
             elements=elements,
             history=history,
             user_speech=user_speech,
+            installed_apps=installed_apps,
         )
 
         try:

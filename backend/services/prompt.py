@@ -7,12 +7,13 @@
 
 import json
 
-from backend.schemas.request import ElementDTO, HistoryEntry
+from backend.schemas.request import ElementDTO, HistoryEntry, InstalledApp
+from backend.services import rules
 
 # v2: 시나리오가 코레일+ KTX 예매 → 카카오톡 사진 보내기로 바뀌면서
 #     KTX 전용 슬롯명(출발역/도착역/좌석등급)을 도메인 중립 표현으로 교체하고,
 #     "후보가 여럿이면 되묻기" 규칙을 추가했다(측정된 최다 오작동 원인).
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v4"
 
 SYSTEM_INSTRUCTION = """\
 당신은 Android 화면을 대신 조작해 주는 접근성 도우미입니다.
@@ -25,6 +26,11 @@ SYSTEM_INSTRUCTION = """\
 
 ## 반드시 지킬 규칙
 
+0. **app이 null이면 아직 아무 앱도 열지 않은 상태입니다.** installed_apps에서 목표에
+   가장 알맞은 앱을 하나 골라 action_type을 "LAUNCH_APP"으로, input_value에 그 앱의
+   package 문자열을 그대로 담고, target_node_id는 -1로 둡니다. 사용자가 앱 이름을
+   말하지 않았어도 목표를 보고 판단하세요(사진을 보낸다 → 메신저 앱).
+   목록에 마땅한 앱이 없으면 ASK_USER로 되물으세요.
 1. **target_node_id는 elements에 실제로 있는 id만** 고릅니다. 없는 id를 지어내지 마세요.
 2. **clickable이 false인 요소는 조작할 수 없습니다.** 화면을 이해하는 데만 참고하세요.
 3. **정보가 부족하면 추측하지 말고 되물으세요.**
@@ -38,8 +44,11 @@ SYSTEM_INSTRUCTION = """\
 5. **전송·결제·확정 같은 실행 버튼도 정상적으로 진행합니다.** 목표 달성에 필요한
    단계이며 특별 취급하지 않습니다. 다만 goal과 화면의 내용이 어긋나 보이면
    그때는 ASK_USER로 확인하세요.
-6. **목표가 달성되었으면 status를 "DONE"으로** 합니다.
-7. **confidence는 보수적으로** 매기세요. 비슷한 후보가 여럿이거나 화면을
+6. **이름 없는 항목은 position_hint로 지목합니다.** 사진처럼 이름이 없는 항목에는
+   "이름 없는 N번째 항목"이라는 position_hint가 붙어 있습니다. 가장 최근 항목은
+   보통 1번째입니다. 힌트가 있으면 그 노드를 정상적으로 고를 수 있습니다.
+7. **목표가 달성되었으면 status를 "DONE"으로** 합니다.
+8. **confidence는 보수적으로** 매기세요. 비슷한 후보가 여럿이거나 화면을
    확신할 수 없으면 낮춥니다. 되돌릴 수 없는 동작이 실행되므로 과신이 곧 피해입니다.
 
 ## voice_message 작성법
@@ -62,13 +71,23 @@ def build_input(
     elements: list[ElementDTO],
     history: list[HistoryEntry] | None,
     user_speech: str | None,
+    installed_apps: list[InstalledApp] | None = None,
 ) -> str:
     """LLM에 보낼 사용자 메시지를 만든다. 토큰을 아끼려고 빈 필드는 싣지 않는다."""
+    # 라벨 없는 clickable 노드는 위치로 지목할 수 있게 힌트를 붙인다(services/rules.py).
+    hints = rules.position_hints(elements)
     payload: dict[str, object] = {
         "goal": goal,
         "app": app_package,
-        "elements": [_serialize_element(element) for element in elements],
+        "elements": [
+            _serialize_element(element, hints.get(element.id)) for element in elements
+        ],
     }
+
+    if installed_apps:
+        payload["installed_apps"] = [
+            {"package": app.package, "label": app.label} for app in installed_apps
+        ]
 
     if history:
         payload["history"] = [
@@ -81,7 +100,9 @@ def build_input(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _serialize_element(element: ElementDTO) -> dict[str, object]:
+def _serialize_element(
+    element: ElementDTO, position_hint: str | None = None
+) -> dict[str, object]:
     """None인 필드를 빼서 노드당 토큰을 줄인다. bounds는 화면상 위치 파악에 쓰이므로 유지."""
     data: dict[str, object] = {
         "id": element.id,
@@ -93,4 +114,10 @@ def _serialize_element(element: ElementDTO) -> dict[str, object]:
         data["text"] = element.text
     if element.content_description:
         data["desc"] = element.content_description
+    if rules.is_editable(element):
+        data["editable"] = True
+    if element.scrollable:
+        data["scrollable"] = True
+    if position_hint:
+        data["position_hint"] = position_hint
     return data

@@ -108,6 +108,12 @@ def validate_action(response: DecideResponse) -> DecideResponse:
     - 조작 대상이 있으면 action_type이 반드시 있어야 클라이언트가 실행할 수 있다.
     - SET_TEXT인데 input_value가 없으면 클라이언트가 무엇을 입력할지 알 수 없다.
     """
+    if response.action_type == "LAUNCH_APP":
+        # 앱 실행은 노드가 아니라 패키지명을 대상으로 한다.
+        if not response.input_value:
+            return _to_unsupported(response, "LAUNCH_APP given without input_value")
+        return response
+
     if response.target_node_id is None:
         return response
 
@@ -130,4 +136,112 @@ def _to_unsupported(response: DecideResponse, reason: str) -> DecideResponse:
             "voice_message": "죄송해요, 이 화면에서는 어떻게 해야 할지 모르겠어요.",
             "reason": reason,
         }
+    )
+
+
+# ---------------------------------------------------------------------------
+# 되돌릴 수 없는 행동 게이트 (구두 동의)
+#
+# 위 모듈 설명이 밝힌 대로 이 파일은 원래 "실행을 막는 게이트는 confidence뿐"이었다.
+# 이 게이트는 제품 요구사항 — "결제·전송 직전에 구두 동의를 받고, 동의하면 그 버튼까지
+# AI가 누른다" — 을 서버단에서 보장하기 위해 추가된 것이다.
+#
+# 설계상 중요한 점 두 가지:
+#  1. 새 status를 만들지 않고 기존 ASK_USER를 재사용한다. Android가 이미 ASK_USER를
+#     처리하므로 클라이언트를 한 줄도 고치지 않아도 동의 왕복이 성립한다.
+#  2. 프롬프트에 의존하지 않는다. LLM이 확인을 빠뜨려도 서버가 독립적으로 잡는다.
+# ---------------------------------------------------------------------------
+
+_HANGUL_BASE = 0xAC00
+_HANGUL_LAST = 0xD7A3
+
+
+def _object_particle(word: str) -> str:
+    """받침 유무로 목적격 조사를 고른다. TTS 문장이 어색해지지 않게 한다."""
+    last = word.strip()[-1:]
+    if not last:
+        return "를"
+    code = ord(last)
+    if not _HANGUL_BASE <= code <= _HANGUL_LAST:
+        return ""
+    return "을" if (code - _HANGUL_BASE) % 28 else "를"
+
+
+def is_irreversible(label: str, irreversible_keywords: list[str]) -> bool:
+    return bool(label) and any(k in label for k in irreversible_keywords)
+
+
+def _contains_affirmative(text: str | None, affirmative_words: list[str]) -> bool:
+    if not text:
+        return False
+    return any(word in text for word in affirmative_words)
+
+
+def _consent_text(goal: str, goal_snapshot: str, user_speech: str | None) -> str:
+    """사용자가 확인 질문에 답한 내용만 뽑아낸다.
+
+    클라이언트는 답변을 두 경로 중 하나로 보낸다 — 짧은 예/아니오는 user_speech로,
+    그 외는 goal 뒤에 이어붙여서(CLAUDE.md §5-1). 어느 쪽이든 받아야 한다.
+
+    **goal 전체를 보면 안 된다.** 원래 목표가 "엄마한테 사진 보내줘"라면 그 안의 "보내"를
+    동의로 오인해 묻지도 않고 전송해버린다. 확인을 요청한 시점 이후에 늘어난 부분만 본다.
+    """
+    delta = goal[len(goal_snapshot):] if goal.startswith(goal_snapshot) else ""
+    return f"{user_speech or ''} {delta}"
+
+
+def check_irreversible_action(
+    response: DecideResponse,
+    elements: list[ElementDTO],
+    *,
+    pending_confirmation: str | None,
+    pending_goal_snapshot: str,
+    goal: str,
+    user_speech: str | None,
+    irreversible_keywords: list[str],
+    affirmative_words: list[str],
+) -> tuple[DecideResponse, str | None]:
+    """되돌릴 수 없는 버튼은 구두 동의를 받은 뒤에만 통과시킨다.
+
+    반환값은 (응답, 갱신된 pending_confirmation)이다.
+
+    통과 조건은 두 가지가 모두 참일 때뿐이다 —
+      (a) 직전에 바로 그 노드에 대해 확인을 요청해 두었고,
+      (b) 확인을 요청한 이후에 들어온 말(user_speech 또는 goal 증분)에 동의 표현이 있다.
+    둘 중 하나라도 아니면 다시 물어본다. 사용자가 거절했는데 LLM이 계속 누르려 해도 막힌다.
+    """
+    if (
+        response.status != "CONTINUE"
+        or response.action_type != "CLICK"
+        or response.target_node_id is None
+    ):
+        return response, pending_confirmation
+
+    target = next((e for e in elements if e.id == response.target_node_id), None)
+    if target is None:
+        return response, pending_confirmation
+
+    label = target.label
+    if not is_irreversible(label, irreversible_keywords):
+        # 다른 행동으로 넘어갔으므로 대기 중이던 확인은 무효가 된다.
+        return response, None
+
+    if pending_confirmation == label and _contains_affirmative(
+        _consent_text(goal, pending_goal_snapshot, user_speech), affirmative_words
+    ):
+        return response, None  # 동의 확인됨 → 통과하고 기록을 지운다
+
+    return (
+        response.model_copy(
+            update={
+                "target_node_id": None,
+                "action_type": None,
+                "input_value": None,
+                "status": "ASK_USER",
+                "instruction": f"irreversible action '{label}' requires spoken confirmation",
+                "voice_message": f"{label}{_object_particle(label)} 진행할까요?",
+                "reason": "awaiting spoken confirmation",
+            }
+        ),
+        label,
     )

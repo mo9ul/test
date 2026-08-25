@@ -1,6 +1,7 @@
 package com.example.pathpilot.testkit
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
@@ -8,6 +9,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.example.pathpilot.agent.AgentTarget
 import com.example.pathpilot.model.ActionType
 import com.example.pathpilot.model.DecideRequest
 import com.example.pathpilot.model.DecideResponse
@@ -36,10 +38,9 @@ import java.util.UUID
  * 알려진 한계 (테스트 용도라 감수):
  * - [nodeMap]에 담아둔 AccessibilityNodeInfo는 서버 응답이 오는 사이 화면이 바뀌면 무효화될 수
  *   있다. performAction이 조용히 실패하면 이게 원인일 가능성이 높다.
- * - 세션은 카카오톡 화면에 들어올 때마다 새로 시작된다. 목표 문장은 [pendingGoal]이 미리 세팅돼
- *   있으면 그걸 쓰고(예: 웨이크업 트리거가 goal을 이미 알고 있는 경우), 없으면 매번 "무엇을
- *   도와드릴까요?"를 TTS로 묻고 STT로 받은 답을 목표로 삼는다 — [startSessionAndCaptureGoal] 참고.
- *   [DEFAULT_GOAL]은 그 STT마저 실패했을 때만 쓰는 최후의 fallback이다.
+ * - 대상 앱과 목표는 [AgentTarget]에서 받는다. 서버가 LAUNCH_APP으로 앱을 정하므로
+ *   이 파일에는 앱 이름이 없다 (CLAUDE.md §12). 목표가 비어 있으면 "무엇을 도와드릴까요?"를
+ *   TTS로 묻고 STT로 받는다 — [startSessionAndCaptureGoal] 참고.
  */
 class TestAccessibilityService : AccessibilityService() {
 
@@ -51,7 +52,7 @@ class TestAccessibilityService : AccessibilityService() {
     private var pendingCollect: Runnable? = null
 
     private var sessionId: String = UUID.randomUUID().toString()
-    private var goal: String = DEFAULT_GOAL
+    private var goal: String = ""
     private var isSessionActive = false
     private var isRequestInFlight = false
     private var consecutiveAskUserCount = 0
@@ -70,12 +71,15 @@ class TestAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         voice = VoiceInteractionManager(this)
         overlay = StatusOverlayManager(this)
-        Log.i(TAG, "TestAccessibilityService connected (target=$TARGET_PACKAGE)")
+        Log.i(TAG, "TestAccessibilityService connected")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // 서버가 LAUNCH_APP으로 지정한 앱에서만 동작한다. 대상이 정해지기 전에는
+        // (= 사용자가 아직 아무것도 요청하지 않았으면) 어떤 화면에도 개입하지 않는다.
+        val targetPackage = AgentTarget.packageName
         val eventPackage = event?.packageName?.toString()
-        if (eventPackage != TARGET_PACKAGE) {
+        if (targetPackage == null || eventPackage != targetPackage) {
             if (isAwaitingGoal) {
                 isAwaitingGoal = false
                 voice.stopListening()
@@ -86,7 +90,9 @@ class TestAccessibilityService : AccessibilityService() {
 
         if (!isSessionActive) {
             isSessionActive = true
-            sessionId = UUID.randomUUID().toString()
+            // 앱 선택 요청과 같은 세션에 묶여야 되묻기·동의가 이어진다.
+            sessionId = pendingSessionId ?: UUID.randomUUID().toString()
+            pendingSessionId = null
             consecutiveAskUserCount = 0
             startSessionAndCaptureGoal()
             return
@@ -97,18 +103,16 @@ class TestAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 새 세션을 시작할 때 목표를 정한다. [pendingGoal]이 미리 세팅돼 있으면(예: adb 테스트로 goal을
-     * 지정해서 트리거한 경우) 그대로 쓰고, 없으면 — 즉 카카오톡이 방금 막 떠서 아직 아무 목표도
+     * 새 세션을 시작할 때 목표를 정한다. [AgentTarget.goal]이 이미 있으면 그대로 쓰고, 없으면 — 즉 카카오톡이 방금 막 떠서 아직 아무 목표도
      * 모르는 보통의 경우 — 바로 "무엇을 도와드릴까요?"를 TTS로 묻고 마이크를 켜서 답변을 목표로 삼는다.
      * 답변을 기다리는 동안 [isAwaitingGoal]을 세워서, 그 사이 들어오는 화면 변경 이벤트가
      * 아직 정해지지 않은 goal로 먼저 요청을 쏘지 않게 막는다.
      */
     private fun startSessionAndCaptureGoal() {
-        val preset = pendingGoal
-        pendingGoal = null
-        if (preset != null) {
+        val preset = AgentTarget.goal
+        if (!preset.isNullOrBlank()) {
             goal = preset
-            overlay.showOrUpdate("테스트 시작: $goal")
+            overlay.showOrUpdate(goal)
             scheduleCollectAndDecide()
             return
         }
@@ -120,15 +124,17 @@ class TestAccessibilityService : AccessibilityService() {
             onAnswer = { answer ->
                 isAwaitingGoal = false
                 goal = answer
+                AgentTarget.goal = answer
                 overlay.showOrUpdate("목표: $goal")
                 scheduleCollectAndDecide()
             },
             onError = { err ->
+                // 인식에 실패했다고 임의의 목표로 진행하지 않는다. 사용자가 말하지 않은 일을
+                // 대신 실행하는 것이 가장 나쁜 실패 모드다.
                 isAwaitingGoal = false
-                Log.w(TAG, "목표 음성 인식 실패($err), 기본 목표로 대체")
-                goal = DEFAULT_GOAL
-                overlay.showOrUpdate("음성 인식 실패, 기본 목표로 진행합니다.")
-                scheduleCollectAndDecide()
+                Log.w(TAG, "목표 음성 인식 실패($err) — 세션을 시작하지 않음")
+                overlay.showOrUpdate("잘 못 들었어요. 다시 불러 주세요.")
+                endSession()
             },
         )
     }
@@ -163,7 +169,8 @@ class TestAccessibilityService : AccessibilityService() {
         var nextId = 1
 
         fun visit(node: AccessibilityNodeInfo) {
-            val text = node.text?.toString()
+            // 비밀번호 필드의 내용은 서버로 보내지 않는다 (CLAUDE.md §4-4).
+            val text = if (node.isPassword) null else node.text?.toString()
             val description = node.contentDescription?.toString()
             if (node.isClickable || !text.isNullOrBlank() || !description.isNullOrBlank()) {
                 val bounds = Rect()
@@ -181,6 +188,9 @@ class TestAccessibilityService : AccessibilityService() {
                             content_description = description,
                             class_name = node.className?.toString() ?: "unknown",
                             clickable = node.isClickable,
+                            editable = node.isEditable,
+                            scrollable = node.isScrollable,
+                            password = node.isPassword,
                             bounds = listOf(bounds.left, bounds.top, bounds.right, bounds.bottom),
                         ),
                     )
@@ -200,7 +210,7 @@ class TestAccessibilityService : AccessibilityService() {
         val request = DecideRequest(
             session_id = sessionId,
             goal = goal,
-            app_package = TARGET_PACKAGE,
+            app_package = AgentTarget.packageName,
             elements = elements,
             user_speech = userSpeech,
         )
@@ -236,7 +246,7 @@ class TestAccessibilityService : AccessibilityService() {
                 consecutiveAskUserCount++
                 if (consecutiveAskUserCount > MAX_CONSECUTIVE_ASK_USER) {
                     overlay.showOrUpdate("답변을 계속 이해하지 못해 중단합니다.")
-                    isSessionActive = false
+                    endSession()
                     return
                 }
                 overlay.showOrUpdate("답변 대기: ${response.voice_message}")
@@ -249,7 +259,7 @@ class TestAccessibilityService : AccessibilityService() {
                     voice.speak(response.voice_message)
                 }
                 overlay.showOrUpdate("완료: ${response.voice_message}")
-                isSessionActive = false
+                endSession()
             }
 
             DecideStatus.UNSUPPORTED -> {
@@ -258,7 +268,7 @@ class TestAccessibilityService : AccessibilityService() {
                     voice.speak(response.voice_message)
                 }
                 overlay.showOrUpdate("중단됨: ${response.reason ?: response.voice_message}")
-                isSessionActive = false
+                endSession()
             }
         }
     }
@@ -271,7 +281,7 @@ class TestAccessibilityService : AccessibilityService() {
     private fun askUserWithRetry(question: String, attempt: Int) {
         if (attempt >= MAX_ASK_RETRIES) {
             overlay.showOrUpdate("답변을 인식하지 못했습니다.")
-            isSessionActive = false
+            endSession()
             return
         }
         voice.askAndListen(
@@ -305,7 +315,33 @@ class TestAccessibilityService : AccessibilityService() {
         return if (normalized in CONFIRMATION_ANSWERS) AnswerType.CONFIRMATION else AnswerType.INFO
     }
 
+    /** 세션을 끝내고 대상 앱·목표를 비운다. 이후 이벤트에는 개입하지 않는다. */
+    private fun endSession() {
+        isSessionActive = false
+        AgentTarget.clear()
+    }
+
+    /** 서버가 지정한 앱을 실행한다. 어떤 앱인지는 서버가 정한다. */
+    private fun launchApp(targetPackage: String) {
+        val intent = packageManager.getLaunchIntentForPackage(targetPackage)
+        if (intent == null) {
+            Log.w(TAG, "실행할 수 없는 패키지: $targetPackage")
+            overlay.showOrUpdate("그 앱을 열 수 없어요.")
+            endSession()
+            return
+        }
+        AgentTarget.packageName = targetPackage
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(intent)
+    }
+
     private fun performTargetAction(response: DecideResponse) {
+        if (response.action_type == ActionType.LAUNCH_APP) {
+            // 서버가 다른 앱으로 넘기려는 경우(잘못된 앱이 열렸을 때 등).
+            response.input_value?.let(::launchApp)
+            return
+        }
+
         val node = response.target_node_id?.let { nodeMap[it] }
         if (node == null || response.action_type == null) {
             Log.w(TAG, "target node를 찾지 못함 (target_node_id=${response.target_node_id})")
@@ -327,8 +363,6 @@ class TestAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "TestA11yService"
-        private const val TARGET_PACKAGE = "com.kakao.talk"
-        private const val DEFAULT_GOAL = "카카오톡에서 가장 최근에 찍은 사진 보내줘"
         private const val DEBOUNCE_MS = 500L
 
         /** STT 인식 실패 시 같은 질문을 다시 묻는 최대 횟수. */
@@ -345,13 +379,10 @@ class TestAccessibilityService : AccessibilityService() {
         )
 
         /**
-         * [com.example.pathpilot.wakeup.WakeAndLaunchActivity]가 화면을 깨우고 카카오톡을 실행하기
-         * 직전에 세팅해두는 이번 세션의 목표 문장(선택 사항). 다음 [onAccessibilityEvent]가 새 세션을
-         * 열 때 한 번 소비하고 null로 되돌린다 — 같은 프로세스 안에서만 오가므로 Intent extra 대신
-         * 정적 필드로 간단히 넘긴다. null이면 [startSessionAndCaptureGoal]이 대신 TTS로 되물어서
-         * 목표를 구한다 — 보통의 경우(웨이크업 트리거가 goal을 미리 모르는 경우) 여기에 해당한다.
+         * [com.example.pathpilot.wakeup.WakeAndLaunchActivity]가 앱 선택 요청에 사용한 세션 id.
+         * 그 요청과 이후 화면 조작이 같은 서버 세션에 묶여야 되묻기·동의가 이어진다.
          */
         @Volatile
-        var pendingGoal: String? = null
+        var pendingSessionId: String? = null
     }
 }
