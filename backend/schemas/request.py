@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class ElementDTO(BaseModel):
@@ -37,6 +37,16 @@ class ElementDTO(BaseModel):
         return (self.text or self.content_description or "").strip()
 
 
+class InstalledApp(BaseModel):
+    """기기에 설치된 앱 하나. app_package가 없을 때(=아직 대상 앱 미실행) LLM이 여기서 고른다.
+
+    목록은 기기가 준다 — 서버도 프롬프트도 어떤 앱이 있는지 미리 알지 못한다.
+    """
+
+    package: str
+    label: str
+
+
 class HistoryEntry(BaseModel):
     """이전 step에서 에이전트가 무엇을 선택했는지에 대한 요약. LLM에 최근 몇 개만 전달한다."""
 
@@ -47,8 +57,18 @@ class HistoryEntry(BaseModel):
 class DecideRequest(BaseModel):
     session_id: str
     goal: str
-    app_package: str
-    elements: list[ElementDTO] = Field(min_length=1)
+    # None = 아직 대상 앱을 실행하지 않은 상태(첫 스텝). 이때만 elements가 비어도 된다.
+    app_package: str | None = None
+    elements: list[ElementDTO]
+    # app_package가 None일 때만 보낸다. 어떤 앱을 열지 LLM이 여기서 고른다.
+    installed_apps: list[InstalledApp] | None = None
     # 사용자의 음성 응답(STT 결과). 확인 질문에 대한 답변 등 대화 턴에서만 채워진다.
     user_speech: str | None = None
     history: list[HistoryEntry] | None = None
+
+    @model_validator(mode="after")
+    def validate_elements_presence(self) -> "DecideRequest":
+        # 앱이 실행된 상태라면 화면 요소가 반드시 있어야 한다.
+        if self.app_package and not self.elements:
+            raise ValueError("elements must not be empty when app_package is set")
+        return self

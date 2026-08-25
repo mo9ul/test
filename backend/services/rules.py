@@ -100,3 +100,77 @@ def unlabeled_ratio(elements: list[ElementDTO]) -> float:
     if not actionable:
         return 0.0
     return sum(1 for e in actionable if not e.label) / len(actionable)
+
+
+# --- 규칙 기반 앱 선택 (LLM 콜 1회 절약) --------------------------------------
+
+import re
+import unicodedata
+
+from backend.schemas.request import InstalledApp
+
+_TOKEN_SPLIT = re.compile(r"[\s,./!?~\-_·]+")
+
+
+def _normalize(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).lower()
+
+
+def _normalize_label(value: str) -> str:
+    return re.sub(r"\s+", "", _normalize(value))
+
+
+def _is_subsequence(needle: str, haystack: str) -> bool:
+    it = iter(haystack)
+    return all(ch in it for ch in needle)
+
+
+def _score(token: str, label: str) -> int:
+    """한 단어와 앱 라벨의 유사도.
+
+    한국어는 조사가 붙는다("카톡으로", "네이버에서"). 조사 사전을 두는 대신
+    **토큰의 접두어를 길이순으로 대조**한다 — "카톡으로"의 접두어 "카톡"이
+    "카카오톡"의 부분수열이므로 매칭된다. 특정 앱 지식이 아니라 순수 문자열 규칙이다.
+    """
+    if not token or not label:
+        return 0
+    for length in range(len(token), 1, -1):
+        prefix = token[:length]
+        if prefix == label:
+            return 100
+        if prefix in label or label in prefix:
+            return 80
+        # 짧은 접두어가 아주 긴 라벨에 우연히 걸리는 것을 막는다
+        if len(label) <= 3 * len(prefix) and _is_subsequence(prefix, label):
+            return 60
+    return 0
+
+
+def resolve_app(
+    goal: str, installed_apps: list[InstalledApp] | None, settings: Settings
+) -> str | None:
+    """goal에서 앱을 직접 짚어낼 수 있으면 LLM 없이 패키지명을 반환한다.
+
+    앱 이름을 아는 게 아니라 **기기가 준 라벨과 사용자 발화를 대조**할 뿐이다.
+    확신이 없거나 후보가 동점이면 None을 반환해 LLM에게 넘긴다(fail-safe).
+    """
+    if not settings.ENABLE_RULE_APP_RESOLUTION or not installed_apps:
+        return None
+
+    tokens = [t for t in _TOKEN_SPLIT.split(_normalize(goal)) if len(t) >= 2]
+    if not tokens:
+        return None
+
+    scored: list[tuple[int, str]] = []
+    for app in installed_apps:
+        label = _normalize_label(app.label)
+        best = max((_score(t, label) for t in tokens), default=0)
+        if best >= settings.APP_MATCH_MIN_SCORE:
+            scored.append((best, app.package))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None  # 동점 — 애매하면 LLM에게 넘긴다
+    return scored[0][1]

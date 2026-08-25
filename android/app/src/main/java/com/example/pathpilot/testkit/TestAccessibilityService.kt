@@ -1,6 +1,7 @@
 package com.example.pathpilot.testkit
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
@@ -8,6 +9,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.example.pathpilot.agent.AgentSession
 import com.example.pathpilot.model.ActionType
 import com.example.pathpilot.model.DecideRequest
 import com.example.pathpilot.model.DecideResponse
@@ -22,12 +24,13 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.UUID
 
 /**
- * 멤버 A 개인 테스트용 AccessibilityService — "카카오톡에서 가장 최근에 찍은 사진 보내줘" 같은
- * depth가 얕은 시나리오로 전체 파이프라인(화면 읽기 → /decide 호출 → 클릭/입력 → 반복)을
- * 직접 눌러보기 위한 최소 구현이다.
+ * 앱이 열린 뒤의 화면 조작 루프를 담당한다 — 화면 읽기 → /decide 호출 → 클릭/입력 → 반복.
+ * 발화 수집과 앱 실행은 MainActivity가 맡고, 목표는 [AgentSession]으로 넘어온다.
+ *
+ * 대상 앱을 코드가 정하지 않는다. 서버가 LAUNCH_APP으로 지정한 앱에서만 동작하므로
+ * 이 파일에는 어떤 앱 이름도 등장하지 않는다 (CLAUDE.md §12).
  *
  * **이건 정식 구현이 아니다.** 멤버 C가 `service/` 아래에 정식 AccessibilityService를 만들면
  * 이 파일과 `res/xml/test_accessibility_service_config.xml`, Manifest의 관련 `<service>`
@@ -36,7 +39,8 @@ import java.util.UUID
  * 알려진 한계 (테스트 용도라 감수):
  * - [nodeMap]에 담아둔 AccessibilityNodeInfo는 서버 응답이 오는 사이 화면이 바뀌면 무효화될 수
  *   있다. performAction이 조용히 실패하면 이게 원인일 가능성이 높다.
- * - 세션은 카카오톡 화면에 들어올 때마다 새로 시작되고, 목표 문장은 [DEFAULT_GOAL]로 고정한다.
+ * - 목표 문장과 세션은 [AgentSession]에서 받는다. MainActivity에서 사용자가 말하고,
+ *   서버가 LAUNCH_APP으로 지정한 앱이 열린 뒤부터 이 서비스가 이어받는다.
  */
 class TestAccessibilityService : AccessibilityService() {
 
@@ -47,9 +51,6 @@ class TestAccessibilityService : AccessibilityService() {
     private val debounceHandler = Handler(Looper.getMainLooper())
     private var pendingCollect: Runnable? = null
 
-    private var sessionId: String = UUID.randomUUID().toString()
-    private var goal: String = DEFAULT_GOAL
-    private var isSessionActive = false
     private var isRequestInFlight = false
 
     /** 이번 스텝에서 화면을 훑을 때 부여한 id -> 실제 노드. §알려진 한계 참고. */
@@ -59,23 +60,19 @@ class TestAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         voice = VoiceInteractionManager(this)
         overlay = StatusOverlayManager(this)
-        Log.i(TAG, "TestAccessibilityService connected (target=$TARGET_PACKAGE)")
+        Log.i(TAG, "TestAccessibilityService connected")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val eventPackage = event?.packageName?.toString()
-        if (eventPackage != TARGET_PACKAGE) {
-            isSessionActive = false
-            return
-        }
+        // 사용자가 발화하지 않았으면 아무 화면에도 개입하지 않는다.
+        val goal = AgentSession.goal ?: return
 
-        if (!isSessionActive) {
-            isSessionActive = true
-            sessionId = UUID.randomUUID().toString()
-            goal = DEFAULT_GOAL
-            overlay.showOrUpdate("테스트 시작: $goal")
-        }
+        // 서버가 LAUNCH_APP으로 지정한 앱의 화면에서만 동작한다.
+        // 대상 앱을 코드가 정하지 않으므로 여기에 앱 이름이 등장하지 않는다.
+        val eventPackage = event?.packageName?.toString() ?: return
+        if (eventPackage != AgentSession.targetPackage) return
 
+        overlay.showOrUpdate(goal)
         scheduleCollectAndDecide()
     }
 
@@ -109,7 +106,8 @@ class TestAccessibilityService : AccessibilityService() {
         var nextId = 1
 
         fun visit(node: AccessibilityNodeInfo) {
-            val text = node.text?.toString()
+            // 비밀번호 필드의 내용은 서버로 보내지 않는다 (CLAUDE.md §4-4).
+            val text = if (node.isPassword) null else node.text?.toString()
             val description = node.contentDescription?.toString()
             if (node.isClickable || !text.isNullOrBlank() || !description.isNullOrBlank()) {
                 val bounds = Rect()
@@ -127,6 +125,9 @@ class TestAccessibilityService : AccessibilityService() {
                             content_description = description,
                             class_name = node.className?.toString() ?: "unknown",
                             clickable = node.isClickable,
+                            editable = node.isEditable,
+                            scrollable = node.isScrollable,
+                            password = node.isPassword,
                             bounds = listOf(bounds.left, bounds.top, bounds.right, bounds.bottom),
                         ),
                     )
@@ -144,9 +145,9 @@ class TestAccessibilityService : AccessibilityService() {
         overlay.showOrUpdate("화면 분석 중… (${elements.size}개 요소)")
 
         val request = DecideRequest(
-            session_id = sessionId,
-            goal = goal,
-            app_package = TARGET_PACKAGE,
+            session_id = AgentSession.sessionId,
+            goal = AgentSession.goal ?: return,
+            app_package = AgentSession.targetPackage,
             elements = elements,
             user_speech = userSpeech,
         )
@@ -188,17 +189,23 @@ class TestAccessibilityService : AccessibilityService() {
 
             DecideStatus.DONE -> {
                 overlay.showOrUpdate("완료: ${response.voice_message}")
-                isSessionActive = false
+                AgentSession.finish()
             }
 
             DecideStatus.UNSUPPORTED -> {
                 overlay.showOrUpdate("중단됨: ${response.reason ?: response.voice_message}")
-                isSessionActive = false
+                AgentSession.finish()
             }
         }
     }
 
     private fun performTargetAction(response: DecideResponse) {
+        if (response.action_type == ActionType.LAUNCH_APP) {
+            // 서버가 다른 앱으로 넘기려는 경우(잘못된 앱이 열렸을 때 등).
+            response.input_value?.let(::launchApp)
+            return
+        }
+
         val node = response.target_node_id?.let { nodeMap[it] }
         if (node == null || response.action_type == null) {
             Log.w(TAG, "target node를 찾지 못함 (target_node_id=${response.target_node_id})")
@@ -218,10 +225,22 @@ class TestAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** 서버가 지정한 앱을 실행한다. 어떤 앱인지는 서버가 정한다. */
+    private fun launchApp(packageName: String) {
+        val intent = packageManager.getLaunchIntentForPackage(packageName)
+        if (intent == null) {
+            Log.w(TAG, "실행할 수 없는 패키지: $packageName")
+            overlay.showOrUpdate("그 앱을 열 수 없어요.")
+            AgentSession.finish()
+            return
+        }
+        AgentSession.targetPackage = packageName
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(intent)
+    }
+
     companion object {
         private const val TAG = "TestA11yService"
-        private const val TARGET_PACKAGE = "com.kakao.talk"
-        private const val DEFAULT_GOAL = "카카오톡에서 가장 최근에 찍은 사진 보내줘"
         private const val DEBOUNCE_MS = 500L
     }
 }

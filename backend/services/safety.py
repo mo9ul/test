@@ -108,6 +108,12 @@ def validate_action(response: DecideResponse) -> DecideResponse:
     - 조작 대상이 있으면 action_type이 반드시 있어야 클라이언트가 실행할 수 있다.
     - SET_TEXT인데 input_value가 없으면 클라이언트가 무엇을 입력할지 알 수 없다.
     """
+    if response.action_type == "LAUNCH_APP":
+        # 앱 실행은 노드가 아니라 패키지명을 대상으로 한다.
+        if not response.input_value:
+            return _to_unsupported(response, "LAUNCH_APP given without input_value")
+        return response
+
     if response.target_node_id is None:
         return response
 

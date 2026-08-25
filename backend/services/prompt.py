@@ -7,13 +7,13 @@
 
 import json
 
-from backend.schemas.request import ElementDTO, HistoryEntry
+from backend.schemas.request import ElementDTO, HistoryEntry, InstalledApp
 from backend.services import rules
 
 # v2: 시나리오가 코레일+ KTX 예매 → 카카오톡 사진 보내기로 바뀌면서
 #     KTX 전용 슬롯명(출발역/도착역/좌석등급)을 도메인 중립 표현으로 교체하고,
 #     "후보가 여럿이면 되묻기" 규칙을 추가했다(측정된 최다 오작동 원인).
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v4"
 
 SYSTEM_INSTRUCTION = """\
 당신은 Android 화면을 대신 조작해 주는 접근성 도우미입니다.
@@ -26,6 +26,11 @@ SYSTEM_INSTRUCTION = """\
 
 ## 반드시 지킬 규칙
 
+0. **app이 null이면 아직 아무 앱도 열지 않은 상태입니다.** installed_apps에서 목표에
+   가장 알맞은 앱을 하나 골라 action_type을 "LAUNCH_APP"으로, input_value에 그 앱의
+   package 문자열을 그대로 담고, target_node_id는 -1로 둡니다. 사용자가 앱 이름을
+   말하지 않았어도 목표를 보고 판단하세요(사진을 보낸다 → 메신저 앱).
+   목록에 마땅한 앱이 없으면 ASK_USER로 되물으세요.
 1. **target_node_id는 elements에 실제로 있는 id만** 고릅니다. 없는 id를 지어내지 마세요.
 2. **clickable이 false인 요소는 조작할 수 없습니다.** 화면을 이해하는 데만 참고하세요.
 3. **정보가 부족하면 추측하지 말고 되물으세요.**
@@ -66,6 +71,7 @@ def build_input(
     elements: list[ElementDTO],
     history: list[HistoryEntry] | None,
     user_speech: str | None,
+    installed_apps: list[InstalledApp] | None = None,
 ) -> str:
     """LLM에 보낼 사용자 메시지를 만든다. 토큰을 아끼려고 빈 필드는 싣지 않는다."""
     # 라벨 없는 clickable 노드는 위치로 지목할 수 있게 힌트를 붙인다(services/rules.py).
@@ -77,6 +83,11 @@ def build_input(
             _serialize_element(element, hints.get(element.id)) for element in elements
         ],
     }
+
+    if installed_apps:
+        payload["installed_apps"] = [
+            {"package": app.package, "label": app.label} for app in installed_apps
+        ]
 
     if history:
         payload["history"] = [

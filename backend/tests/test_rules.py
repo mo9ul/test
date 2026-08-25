@@ -125,3 +125,31 @@ def test_loading_only_when_nothing_survives_filtering() -> None:
 )
 def test_unlabeled_ratio(elements, expected) -> None:
     assert rules.unlabeled_ratio(elements) == expected
+
+
+# --- 규칙 기반 앱 선택 --------------------------------------------------------
+
+from backend.schemas.request import InstalledApp  # noqa: E402
+
+APPS = [
+    InstalledApp(package="com.kakao.talk", label="카카오톡"),
+    InstalledApp(package="com.nhn.android.search", label="네이버"),
+    InstalledApp(package="com.google.android.apps.photos", label="Google 포토"),
+]
+
+
+@pytest.mark.parametrize(
+    "goal,expected",
+    [
+        ("카카오톡으로 사진 보내줘", "com.kakao.talk"),
+        ("카톡으로 사진 보내줘", "com.kakao.talk"),      # 조사 붙은 축약어
+        ("네이버에서 날씨 검색해줘", "com.nhn.android.search"),
+        ("엄마한테 사진 보내줘", None),                   # 앱 언급 없음 -> LLM에게
+    ],
+)
+def test_resolve_app(goal: str, expected: str | None) -> None:
+    assert rules.resolve_app(goal, APPS, SETTINGS) == expected
+
+
+def test_resolve_app_needs_installed_apps() -> None:
+    assert rules.resolve_app("카카오톡 열어줘", None, SETTINGS) is None

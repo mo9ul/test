@@ -7,6 +7,14 @@
     <string name="permission_button_microphone">마이크 허용</string>
     <string name="permission_button_overlay">다른 앱 위에 표시 허용</string>
 
-    <!-- 멤버 A: 개인 테스트용 AccessibilityService (카카오톡 사진 전송 시나리오) -->
-    <string name="test_accessibility_service_description">테스트용: 카카오톡 화면을 읽고 AI 지시에 따라 클릭합니다.</string>
+    <!-- AccessibilityService 설명 — 시스템 접근성 설정 화면에 그대로 노출된다 -->
+    <string name="test_accessibility_service_description">말씀하신 일을 대신 하기 위해 화면을 읽고 버튼을 눌러 드립니다. 보내기·결제처럼 되돌릴 수 없는 동작은 먼저 여쭤봅니다.</string>
+
+    <!-- 메인 화면 (음성 진입) -->
+    <string name="main_idle">버튼을 누르고\n하고 싶은 일을 말씀하세요</string>
+    <string name="main_mic_button">🎤\n말하기</string>
+    <string name="main_listening">듣고 있어요…</string>
+    <string name="main_thinking">준비하고 있어요…</string>
+    <string name="main_need_mic">마이크 권한이 필요해요</string>
+    <string name="main_need_accessibility">접근성 서비스를 먼저 켜주세요</string>
 </resources>

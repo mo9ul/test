@@ -54,7 +54,7 @@ def _stub_client(response: DecideResponse):
     """고정 응답을 돌려주는 AI 클라이언트 스텁을 주입한다."""
 
     class StubAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             return response
 
     app.dependency_overrides[get_ai_client] = lambda: StubAIClient()
@@ -193,7 +193,7 @@ def test_ai_client_error_returns_unsupported_not_500() -> None:
     """LLM 호출 실패에도 서버는 계약 스키마로 응답해야 한다 (CLAUDE.md 12장)."""
 
     class FailingAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             raise AIClientError("Gemini API error 503: unavailable")
 
     app.dependency_overrides[get_ai_client] = lambda: FailingAIClient()
@@ -211,7 +211,7 @@ def test_ai_client_error_detail_is_not_leaked_to_client() -> None:
     """API 키나 내부 오류 문자열이 응답 본문으로 새면 안 된다."""
 
     class FailingAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             raise AIClientError("Gemini API error 401: bad key AIzaSyTOPSECRET")
 
     app.dependency_overrides[get_ai_client] = lambda: FailingAIClient()
@@ -226,7 +226,7 @@ def test_ai_client_timeout_returns_unsupported(monkeypatch) -> None:
     monkeypatch.setattr("backend.routers.decide.AI_CLIENT_TIMEOUT_SECONDS", 0.1)
 
     class SlowAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             time.sleep(0.5)
             return _response()
 
@@ -248,7 +248,7 @@ def test_send_element_is_not_filtered_from_ai_input() -> None:
     captured: list = []
 
     class SpyAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             captured.extend(elements)
             return _response()
 
@@ -326,7 +326,7 @@ def test_personal_data_is_masked_before_ai_call() -> None:
     captured: list = []
 
     class SpyAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             captured.extend(elements)
             return _response()
 
@@ -379,7 +379,7 @@ def test_session_history_is_passed_to_ai_on_next_turn() -> None:
     captured: list = []
 
     class SpyAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             captured.append(history)
             return _response()
 
@@ -397,7 +397,7 @@ def test_sessions_are_isolated_by_session_id() -> None:
     captured: list = []
 
     class SpyAIClient:
-        def decide(self, goal, app_package, elements, history, user_speech=None):
+        def decide(self, goal, app_package, elements, history, user_speech=None, installed_apps=None):
             captured.append(history)
             return _response()
 
@@ -432,3 +432,85 @@ def test_object_particle_matches_final_consonant(word: str, expected: str) -> No
     from backend.services.ai_client import _object_particle
 
     assert _object_particle(word) == expected
+
+
+# --- 앱 실행 (첫 스텝, app_package=None) ------------------------------------
+
+APPS = [
+    {"package": "com.kakao.talk", "label": "카카오톡"},
+    {"package": "com.nhn.android.search", "label": "네이버"},
+]
+
+
+def _launch_payload(goal: str, installed_apps=APPS, session_id="launch-session") -> dict:
+    return {
+        "session_id": session_id,
+        "goal": goal,
+        "app_package": None,
+        "elements": [],
+        "installed_apps": installed_apps,
+        "user_speech": None,
+        "history": None,
+    }
+
+
+def test_rule_resolves_app_without_calling_llm() -> None:
+    """goal에 앱이 드러나면 LLM을 부르지 않고 바로 실행한다."""
+    calls = []
+
+    class CountingAIClient:
+        def decide(self, goal, app_package, elements, history, user_speech=None,
+                   installed_apps=None):
+            calls.append(1)
+            return _response()
+
+    app.dependency_overrides[get_ai_client] = lambda: CountingAIClient()
+
+    body = client.post(
+        "/api/v1/decide", json=_launch_payload("카톡으로 엄마한테 사진 보내줘")
+    ).json()
+
+    assert body["action_type"] == "LAUNCH_APP"
+    assert body["input_value"] == "com.kakao.talk"
+    assert body["status"] == "CONTINUE"
+    assert calls == []  # LLM 콜 0회
+
+
+def test_ambiguous_goal_falls_through_to_llm() -> None:
+    """앱을 짚어낼 수 없으면 규칙이 개입하지 않고 LLM에게 넘긴다."""
+    _stub_client(
+        _response(
+            target_node_id=None,
+            action_type="LAUNCH_APP",
+            input_value="com.kakao.talk",
+            voice_message="카카오톡을 열게요.",
+        )
+    )
+
+    body = client.post(
+        "/api/v1/decide", json=_launch_payload("엄마한테 사진 보내줘")
+    ).json()
+
+    assert body["action_type"] == "LAUNCH_APP"
+    assert body["input_value"] == "com.kakao.talk"
+
+
+def test_empty_elements_allowed_only_without_app_package() -> None:
+    ok = client.post("/api/v1/decide", json=_launch_payload("카톡 열어줘"))
+    assert ok.status_code == 200
+
+    bad = client.post("/api/v1/decide", json=_payload(elements=[]))
+    assert bad.status_code == 422
+
+
+def test_launch_app_without_package_is_rejected() -> None:
+    """LLM이 패키지명을 빠뜨리면 실행할 수 없으므로 UNSUPPORTED로 막는다."""
+    _stub_client(
+        _response(target_node_id=None, action_type="LAUNCH_APP", input_value=None)
+    )
+
+    body = client.post(
+        "/api/v1/decide", json=_launch_payload("엄마한테 사진 보내줘")
+    ).json()
+
+    assert body["status"] == "UNSUPPORTED"

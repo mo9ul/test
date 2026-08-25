@@ -3,6 +3,18 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- 멤버 A(Infra/Voice/UX) 담당 권한. Accessibility 서비스 자체 선언은 멤버 C가 service/ 아래에 추가 -->
+    <!--
+      Android 11(API 30)+에서 다른 앱을 조회·실행하려면 필수다. 이게 없으면
+      queryIntentActivities가 빈 목록을 돌려주고, 서버가 열 앱을 고를 수 없어
+      첫 스텝부터 실패한다.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -34,7 +46,8 @@
             android:exported="true" />
 
         <!--
-          멤버 A 개인 테스트용 서비스. 카카오톡 하나만 대상(res/xml/test_accessibility_service_config.xml).
+          화면을 읽고 자동 조작하는 서비스. 대상 앱은 코드가 정하지 않고 서버가 LAUNCH_APP으로
+          지정한다. 사용자가 발화하기 전에는 어떤 화면에도 개입하지 않는다.
           멤버 C가 정식 AccessibilityService를 만들면 이 <service> 블록과 관련 파일은 지운다.
         -->
         <service

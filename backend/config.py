@@ -56,6 +56,8 @@ class Settings(BaseSettings):
 
     # --- 규칙 기반 최적화 (services/rules.py) ---
     MAX_ELEMENTS_TO_LLM: int = 60
+    ENABLE_RULE_APP_RESOLUTION: bool = True
+    APP_MATCH_MIN_SCORE: int = 60
     # 같은 화면에서 연속 몇 스텝까지 허용할지. 입력→클릭처럼 한 화면에서 여러 스텝이
     # 정상인 경우가 있어 3은 너무 빡빡하다.
     MAX_REPEATED_SCREENS: int = 5

@@ -104,6 +104,25 @@ async def decide(
             reason="화면 반복",
         )
         rule_hit = "repeat_guard"
+    elif request.app_package is None:
+        # 아직 앱을 열지 않은 첫 스텝. goal에서 앱을 직접 짚어낼 수 있으면 LLM 콜을 통째로 아낀다.
+        package = rules.resolve_app(request.goal, request.installed_apps, settings)
+        if package is not None:
+            label = next(
+                (a.label for a in (request.installed_apps or []) if a.package == package),
+                package,
+            )
+            response = DecideResponse(
+                target_node_id=None,
+                action_type="LAUNCH_APP",
+                input_value=package,
+                instruction=f"{package} 실행 (규칙 매칭)",
+                voice_message=f"{label} 열게요.",
+                confidence=1.0,
+                status="CONTINUE",
+                reason="resolved by rule",
+            )
+            rule_hit = "app_resolution"
     elif rules.is_loading_screen(filtered_elements):
         # 조작 가능한 요소가 하나도 없다 = 아직 로딩 중. LLM에 물어봐야 답이 없다.
         # voice_message는 비워 둔다 — 로딩마다 TTS가 울리면 시끄럽다.
@@ -130,6 +149,7 @@ async def decide(
                     elements=filtered_elements,
                     history=history,
                     user_speech=request.user_speech,
+                    installed_apps=request.installed_apps,
                 ),
                 timeout=AI_CLIENT_TIMEOUT_SECONDS,
             )
